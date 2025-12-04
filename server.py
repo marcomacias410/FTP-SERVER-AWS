@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""
-AWS-ready TCP file server:
-- Stores files in S3 (PUT / GET / LS)
-- Emits CloudWatch metrics
-- Graceful shutdown on SIGTERM (suitable for EC2 lifecycle/NLB draining)
-- Uses plain TCP (keep using your client)
-"""
-
 import os
 import socket
 import threading
@@ -258,3 +249,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
