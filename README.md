@@ -158,7 +158,7 @@ Uploaded: My Report.pdf
 
 ---
 
-### `exit` or `quit`
+### `exit`
 **Purpose:** Disconnect from the server and close the client.
 
 **Usage:**
