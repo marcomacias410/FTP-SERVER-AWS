@@ -2,29 +2,30 @@ import os
 import socket
 import threading
 import signal
-import sys
 from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
 
-# Config (set via environment or edit here)
+# ---------------- CONFIG ----------------
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("FTP_PORT", 5001))
 BUFFER = 4096
 S3_BUCKET = os.environ.get("S3_BUCKET", "cpsc-471-bucket")
+AWS_REGION = os.environ.get("AWS_REGION")
 
-# boto3 clients (use EC2 IAM role)
+# ---------------- AWS CLIENTS ----------------
 session = boto3.Session(region_name=AWS_REGION) if AWS_REGION else boto3.Session()
 s3 = session.client("s3")
 cloudwatch = session.client("cloudwatch")
-AWS_REGION = os.environ.get("AWS_REGION", None) 
 
-# internal state
+# ---------------- STATE ----------------
 clients = []
 clients_lock = threading.Lock()
 shutdown_event = threading.Event()
 server_sock = None
 
+
+# ---------------- CLOUDWATCH METRICS ----------------
 def put_metric(metric_name, value, unit="Count"):
     try:
         cloudwatch.put_metric_data(
@@ -36,22 +37,24 @@ def put_metric(metric_name, value, unit="Count"):
             }]
         )
     except Exception as e:
-        # metric push should not crash server
         print("CloudWatch put_metric failed:", e)
 
+
+# ---------------- CLIENT HANDLER ----------------
 def handle_client(conn, addr):
     with clients_lock:
         clients.append(conn)
         put_metric("ActiveClients", len(clients))
 
     print(f"[+] Connected: {addr}")
+
     try:
         conn.settimeout(10.0)
+
         while not shutdown_event.is_set():
             try:
                 data = conn.recv(BUFFER)
             except socket.timeout:
-                # loop back to check shutdown event periodically
                 continue
             except OSError:
                 break
@@ -72,19 +75,19 @@ def handle_client(conn, addr):
                 try:
                     rsp_lines = []
                     paginator = s3.get_paginator("list_objects_v2")
-                    page_iter = paginator.paginate(Bucket=S3_BUCKET)
-                    found_any = False
-                    for page in page_iter:
+
+                    for page in paginator.paginate(Bucket=S3_BUCKET):
                         for obj in page.get("Contents", []):
-                            found_any = True
                             name = obj["Key"]
                             size = obj["Size"]
                             last_mod = obj["LastModified"].strftime("%Y-%m-%d %H:%M:%S")
                             rsp_lines.append(f"{size:12} {last_mod} {name}")
-                    if not found_any:
+
+                    if not rsp_lines:
                         conn.sendall(b"No files in bucket\n")
                     else:
                         conn.sendall(("\n".join(rsp_lines) + "\n").encode())
+
                 except ClientError as e:
                     conn.sendall(f"ERR S3 list error: {e}\n".encode())
 
@@ -93,27 +96,26 @@ def handle_client(conn, addr):
                 if len(parts) < 2:
                     conn.sendall(b"ERR Invalid GET format\n")
                     continue
+
                 remote = " ".join(parts[1:])
                 safe = os.path.basename(remote)
+
                 try:
-                    # Use streaming body to avoid loading entire file into memory
                     obj = s3.get_object(Bucket=S3_BUCKET, Key=safe)
                 except ClientError:
                     conn.sendall(b"ERR File not found\n")
                     continue
 
                 filesize = obj["ContentLength"]
-                conn.sendall(f"OK {filesize}".encode())
-                # wait for client ACK
+                conn.sendall(f"OK {filesize}\n".encode())
+
                 try:
                     ack = conn.recv(BUFFER)
                 except Exception:
-                    ack = b''
-                if not ack:
-                    # client didn't ACK; skip
                     continue
 
                 body = obj["Body"]
+
                 while True:
                     chunk = body.read(BUFFER)
                     if not chunk:
@@ -128,24 +130,24 @@ def handle_client(conn, addr):
 
             # ---------------- PUT ----------------
             elif command == "put":
-                # Format: put <filename> <filesize>
                 if len(parts) < 3:
                     conn.sendall(b"ERR Invalid PUT format\n")
                     continue
+
                 try:
                     filesize = int(parts[-1])
                 except ValueError:
                     conn.sendall(b"ERR Invalid filesize\n")
                     continue
+
                 filename = " ".join(parts[1:-1])
                 safe = os.path.basename(filename)
 
-                # ACK to client to begin upload
-                conn.sendall(b"OK")
-                remaining = filesize
+                conn.sendall(b"OK\n")
 
-                # stream to a temporary file to avoid large memory use
+                remaining = filesize
                 tmp_path = f"/tmp/upload-{threading.get_ident()}-{safe}"
+
                 try:
                     with open(tmp_path, "wb") as f:
                         while remaining > 0:
@@ -155,17 +157,18 @@ def handle_client(conn, addr):
                             f.write(chunk)
                             remaining -= len(chunk)
 
-                    # Upload to S3 from file
                     s3.upload_file(Filename=tmp_path, Bucket=S3_BUCKET, Key=safe)
+
                     put_metric("Uploads", 1)
                     print(f"[+] Uploaded to S3: {safe}")
-                    conn.sendall(b"OK Uploaded\n")
+
                 except Exception as e:
                     print("Upload error:", e)
                     try:
                         conn.sendall(f"ERR Upload failed: {e}\n".encode())
                     except Exception:
                         pass
+
                 finally:
                     try:
                         if os.path.exists(tmp_path):
@@ -173,12 +176,7 @@ def handle_client(conn, addr):
                     except Exception:
                         pass
 
-            # ---------------- SHUTDOWN (not recommended in AWS) ----------------
-            elif command == "shutdown":
-                conn.sendall(b"OK Shutting down\n")
-                shutdown_event.set()
-                break
-
+            # ---------------- UNKNOWN ----------------
             else:
                 conn.sendall(b"ERR Unknown command\n")
 
@@ -187,25 +185,30 @@ def handle_client(conn, addr):
             if conn in clients:
                 clients.remove(conn)
             put_metric("ActiveClients", len(clients))
+
         try:
             conn.close()
         except Exception:
             pass
+
         print(f"[-] Connection closed: {addr}")
 
 
+# ---------------- SIGNAL HANDLER ----------------
 def signal_handler(signum, frame):
     print("Signal received:", signum, "shutting down")
     shutdown_event.set()
-    # close server socket to break accept loop
     try:
         if server_sock:
             server_sock.close()
     except Exception:
         pass
 
+
+# ---------------- MAIN ----------------
 def main():
     global server_sock
+
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -230,13 +233,10 @@ def main():
             t.start()
 
     finally:
-        print("[*] Server shutting down: notifying clients")
+        print("[*] Server shutting down")
+
         with clients_lock:
             for c in list(clients):
-                try:
-                    c.sendall(b"SHUTDOWN")
-                except Exception:
-                    pass
                 try:
                     c.shutdown(socket.SHUT_RDWR)
                 except Exception:
@@ -245,10 +245,9 @@ def main():
                     c.close()
                 except Exception:
                     pass
+
         print("[*] Shutdown complete")
+
 
 if __name__ == "__main__":
     main()
-
-
-
