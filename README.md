@@ -30,7 +30,7 @@ or
 python3 --version
 ```
 
-How to Execute (Step-by-Step for Beginners)
+How to Execute
 --------------------------------------------
 ### Step 1: Start the Client
 The client is the program you use to upload and download files to/from the server.
