@@ -17,6 +17,7 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "cpsc-471-bucket")
 session = boto3.Session(region_name=AWS_REGION) if AWS_REGION else boto3.Session()
 s3 = session.client("s3")
 cloudwatch = session.client("cloudwatch")
+AWS_REGION = os.environ.get("AWS_REGION", None) 
 
 # internal state
 clients = []
@@ -248,5 +249,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
