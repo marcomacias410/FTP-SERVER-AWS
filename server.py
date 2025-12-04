@@ -11,8 +11,7 @@ from botocore.exceptions import ClientError
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("FTP_PORT", 5001))
 BUFFER = 4096
-S3_BUCKET = os.environ.get("S3_BUCKET", "your-bucket-name")
-AWS_REGION = os.environ.get("AWS_REGION", None)  # optional
+S3_BUCKET = os.environ.get("S3_BUCKET", "cpsc-471-bucket")
 
 # boto3 clients (use EC2 IAM role)
 session = boto3.Session(region_name=AWS_REGION) if AWS_REGION else boto3.Session()
@@ -249,4 +248,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
