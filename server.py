@@ -3,20 +3,41 @@ import socket
 import threading
 import signal
 from datetime import datetime
-import boto3
-from botocore.exceptions import ClientError
+
+# ---------------- SAFE AWS IMPORT ----------------
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except ImportError:
+    boto3 = None
+    ClientError = Exception
+
 
 # ---------------- CONFIG ----------------
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("FTP_PORT", 5001))
 BUFFER = 4096
-S3_BUCKET = os.environ.get("S3_BUCKET", "cpsc-471-bucket")
+S3_BUCKET = os.environ.get("S3_BUCKET", "")
 AWS_REGION = os.environ.get("AWS_REGION")
 
+AWS_ENABLED = bool(AWS_REGION)
+
+
+# ---------------- LOCAL STORAGE ----------------
+LOCAL_DIR = "./uploads"
+os.makedirs(LOCAL_DIR, exist_ok=True)
+
 # ---------------- AWS CLIENTS ----------------
-session = boto3.Session(region_name=AWS_REGION) if AWS_REGION else boto3.Session()
-s3 = session.client("s3")
-cloudwatch = session.client("cloudwatch")
+if AWS_ENABLED and boto3 is not None:
+    session = boto3.Session(region_name=AWS_REGION)
+    s3 = session.client("s3")
+    cloudwatch = session.client("cloudwatch")
+    print("[*] AWS MODE ENABLED")
+else:
+    session = None
+    s3 = None
+    cloudwatch = None
+    print("[*] LOCAL MODE ENABLED (no AWS)")
 
 # ---------------- STATE ----------------
 clients = []
@@ -27,6 +48,8 @@ server_sock = None
 
 # ---------------- CLOUDWATCH METRICS ----------------
 def put_metric(metric_name, value, unit="Count"):
+    if not AWS_ENABLED:
+        return
     try:
         cloudwatch.put_metric_data(
             Namespace="MyFTPServer",
@@ -52,44 +75,43 @@ def handle_client(conn, addr):
         conn.settimeout(10.0)
 
         while not shutdown_event.is_set():
-            try:
-                data = conn.recv(BUFFER)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-
+            data = conn.recv(BUFFER)
             if not data:
-                print(f"[-] Client disconnected: {addr}")
                 break
 
             cmd = data.decode(errors="ignore").strip()
-            if not cmd:
-                continue
-
             parts = cmd.split()
-            command = parts[0].lower()
+            command = parts[0].lower() if parts else ""
 
             # ---------------- LS ----------------
             if command == "ls":
-                try:
-                    rsp_lines = []
-                    paginator = s3.get_paginator("list_objects_v2")
+                rsp_lines = []
 
-                    for page in paginator.paginate(Bucket=S3_BUCKET):
-                        for obj in page.get("Contents", []):
-                            name = obj["Key"]
-                            size = obj["Size"]
-                            last_mod = obj["LastModified"].strftime("%Y-%m-%d %H:%M:%S")
-                            rsp_lines.append(f"{size:12} {last_mod} {name}")
+                if not AWS_ENABLED:
+                    for name in os.listdir(LOCAL_DIR):
+                        path = os.path.join(LOCAL_DIR, name)
+                        size = os.path.getsize(path)
+                        mod = datetime.fromtimestamp(
+                            os.path.getmtime(path)
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+                        rsp_lines.append(f"{size:12} {mod} {name}")
+                else:
+                    try:
+                        paginator = s3.get_paginator("list_objects_v2")
+                        for page in paginator.paginate(Bucket=S3_BUCKET):
+                            for obj in page.get("Contents", []):
+                                name = obj["Key"]
+                                size = obj["Size"]
+                                last_mod = obj["LastModified"].strftime("%Y-%m-%d %H:%M:%S")
+                                rsp_lines.append(f"{size:12} {last_mod} {name}")
+                    except ClientError as e:
+                        conn.sendall(f"ERR S3 list error: {e}\n".encode())
+                        continue
 
-                    if not rsp_lines:
-                        conn.sendall(b"No files in bucket\n")
-                    else:
-                        conn.sendall(("\n".join(rsp_lines) + "\n").encode())
-
-                except ClientError as e:
-                    conn.sendall(f"ERR S3 list error: {e}\n".encode())
+                if not rsp_lines:
+                    conn.sendall(b"No files\n")
+                else:
+                    conn.sendall(("\n".join(rsp_lines) + "\n").encode())
 
             # ---------------- GET ----------------
             elif command == "get":
@@ -97,36 +119,43 @@ def handle_client(conn, addr):
                     conn.sendall(b"ERR Invalid GET format\n")
                     continue
 
-                remote = " ".join(parts[1:])
-                safe = os.path.basename(remote)
+                safe = os.path.basename(" ".join(parts[1:]))
 
-                try:
-                    obj = s3.get_object(Bucket=S3_BUCKET, Key=safe)
-                except ClientError:
-                    conn.sendall(b"ERR File not found\n")
-                    continue
+                if not AWS_ENABLED:
+                    path = os.path.join(LOCAL_DIR, safe)
+                    if not os.path.exists(path):
+                        conn.sendall(b"ERR File not found\n")
+                        continue
 
-                filesize = obj["ContentLength"]
-                conn.sendall(f"OK {filesize}\n".encode())
+                    filesize = os.path.getsize(path)
+                    conn.sendall(f"OK {filesize}\n".encode())
+                    conn.recv(BUFFER)
 
-                try:
-                    ack = conn.recv(BUFFER)
-                except Exception:
-                    continue
-
-                body = obj["Body"]
-
-                while True:
-                    chunk = body.read(BUFFER)
-                    if not chunk:
-                        break
+                    with open(path, "rb") as f:
+                        while True:
+                            chunk = f.read(BUFFER)
+                            if not chunk:
+                                break
+                            conn.sendall(chunk)
+                else:
                     try:
+                        obj = s3.get_object(Bucket=S3_BUCKET, Key=safe)
+                    except ClientError:
+                        conn.sendall(b"ERR File not found\n")
+                        continue
+
+                    filesize = obj["ContentLength"]
+                    conn.sendall(f"OK {filesize}\n".encode())
+                    conn.recv(BUFFER)
+
+                    body = obj["Body"]
+                    while True:
+                        chunk = body.read(BUFFER)
+                        if not chunk:
+                            break
                         conn.sendall(chunk)
-                    except Exception:
-                        break
 
                 put_metric("Downloads", 1)
-                print(f"[+] Served GET {safe} to {addr}")
 
             # ---------------- PUT ----------------
             elif command == "put":
@@ -140,43 +169,26 @@ def handle_client(conn, addr):
                     conn.sendall(b"ERR Invalid filesize\n")
                     continue
 
-                filename = " ".join(parts[1:-1])
-                safe = os.path.basename(filename)
-
+                safe = os.path.basename(" ".join(parts[1:-1]))
                 conn.sendall(b"OK\n")
 
                 remaining = filesize
-                tmp_path = f"/tmp/upload-{threading.get_ident()}-{safe}"
+                tmp_path = os.path.join(LOCAL_DIR, safe)
 
-                try:
-                    with open(tmp_path, "wb") as f:
-                        while remaining > 0:
-                            chunk = conn.recv(min(BUFFER, remaining))
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            remaining -= len(chunk)
+                with open(tmp_path, "wb") as f:
+                    while remaining > 0:
+                        chunk = conn.recv(min(BUFFER, remaining))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
 
-                    s3.upload_file(Filename=tmp_path, Bucket=S3_BUCKET, Key=safe)
+                if AWS_ENABLED:
+                    s3.upload_file(tmp_path, S3_BUCKET, safe)
 
-                    put_metric("Uploads", 1)
-                    print(f"[+] Uploaded to S3: {safe}")
+                put_metric("Uploads", 1)
+                print(f"[+] Stored: {safe}")
 
-                except Exception as e:
-                    print("Upload error:", e)
-                    try:
-                        conn.sendall(f"ERR Upload failed: {e}\n".encode())
-                    except Exception:
-                        pass
-
-                finally:
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                    except Exception:
-                        pass
-
-            # ---------------- UNKNOWN ----------------
             else:
                 conn.sendall(b"ERR Unknown command\n")
 
@@ -190,13 +202,11 @@ def handle_client(conn, addr):
             conn.close()
         except Exception:
             pass
-
         print(f"[-] Connection closed: {addr}")
 
 
 # ---------------- SIGNAL HANDLER ----------------
 def signal_handler(signum, frame):
-    print("Signal received:", signum, "shutting down")
     shutdown_event.set()
     try:
         if server_sock:
@@ -218,7 +228,8 @@ def main():
     server_sock.listen(128)
     server_sock.settimeout(1.0)
 
-    print(f"Server listening on {HOST}:{PORT} (S3 bucket: {S3_BUCKET})")
+    mode = "AWS (S3)" if AWS_ENABLED else "LOCAL FILESYSTEM"
+    print(f"Server listening on {HOST}:{PORT} [{mode}]")
 
     try:
         while not shutdown_event.is_set():
@@ -229,24 +240,19 @@ def main():
             except OSError:
                 break
 
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            t.start()
+            threading.Thread(
+                target=handle_client,
+                args=(conn, addr),
+                daemon=True
+            ).start()
 
     finally:
-        print("[*] Server shutting down")
-
         with clients_lock:
             for c in list(clients):
-                try:
-                    c.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
                 try:
                     c.close()
                 except Exception:
                     pass
-
-        print("[*] Shutdown complete")
 
 
 if __name__ == "__main__":
